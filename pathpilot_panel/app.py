@@ -46,6 +46,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from flask import Flask, jsonify, request, send_from_directory
+from playwright_executor import (
+    PlaywrightSafetyError,
+    assert_same_origin_https,
+    capture_readonly_navigation,
+    replay_readonly_workflow,
+)
 
 REPO_ROOT = Path(r"D:\hermes")
 ENV_PATH = REPO_ROOT / ".env"
@@ -485,6 +491,28 @@ def spawn_hermes_run(session_id: str, site_id: str, workflow_id: str) -> None:
     t.start()
 
 
+def spawn_playwright_run(session_id: str, policy: dict, workflow: dict) -> None:
+    """Replay a controller-validated read-only workflow in a dedicated visible browser."""
+    def _run():
+        try:
+            push_event(session_id, "state", "Opening the dedicated read-only browser.")
+            results = replay_readonly_workflow(policy=policy, workflow=workflow, headless=False)
+            session = _load_session(session_id)
+            for result in results:
+                push_event(session_id, "narration", f"Opened the verified page for {result['step_id']}.", step_id=result["step_id"])
+                push_event(session_id, "verification", result["verification"], step_id=result["step_id"], meta={"url": result["url"]})
+                session["last_completed_step"] = result["step_id"]
+                session["current_step"] = result["step_id"]
+            session["next_step"] = "complete"
+            session["status"] = "completed"
+            _save_session(session)
+            push_event(session_id, "state", "Read-only walkthrough completed.", meta={"status": "completed"})
+        except Exception as exc:  # noqa: BLE001
+            push_event(session_id, "safety", f"Read-only browser walkthrough stopped: {exc}", meta={"error": True})
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ---- ElevenLabs TTS with barge-in support ----------------------------------------
 
 _playback_lock = threading.Lock()
@@ -685,8 +713,92 @@ def api_teach_start():
         "display_name": display_name,
         "domain": hostname,
         "status": "draft_policy_created",
-        "message": "Draft safety policy created. Next: Hermes TEACH captures 3–6 visible, read-only steps. The site remains absent from Run until a workflow pack is registered."
+        "message": "Draft safety policy created. Next: capture a real visible, read-only workflow step. The site remains absent from Run until a workflow pack is registered."
     })
+
+
+@app.route("/api/teach/capture", methods=["POST"])
+def api_teach_capture():
+    """Capture one verified public, same-origin, read-only navigation with Playwright."""
+    payload = request.get_json(force=True) or {}
+    active_tab_url = payload.get("active_tab_url", "")
+    parsed = urlparse(active_tab_url)
+    hostname = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not hostname:
+        return jsonify({"error": "teach_requires_https_active_tab"}), 400
+    site_id = re.sub(r"[^a-z0-9]+", "-", hostname).strip("-")
+    try:
+        policy = _load_site_policy(site_id)
+        assert_same_origin_https(active_tab_url, policy)
+        workflow = capture_readonly_navigation(
+            policy=policy,
+            title=(payload.get("workflow_title") or "Read-only website tour").strip(),
+            start_url=active_tab_url,
+            requested_link_text=(payload.get("visible_link_text") or "").strip(),
+            headless=bool(payload.get("headless", False)),
+        )
+    except PlaywrightSafetyError as exc:
+        return jsonify({"error": "capture_refused", "reason": str(exc)}), 400
+    except Exception as exc:  # browser/network failure is not a workflow
+        return jsonify({"error": "capture_failed", "reason": str(exc)}), 502
+
+    workflow_path = WORKFLOWS_DIR / site_id / f"{workflow['workflow_id']}.json"
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
+    workflow_path.write_text(json.dumps(workflow, indent=2), encoding="utf-8")
+    return jsonify({
+        "status": "draft_captured", "site_id": site_id, "workflow_id": workflow["workflow_id"],
+        "workflow_path": str(workflow_path), "workflow": workflow,
+        "message": "Read-only browser step captured and verified. Review it, then explicitly save before it becomes runnable.",
+    }), 201
+
+
+@app.route("/api/teach/save", methods=["POST"])
+def api_teach_save():
+    """Explicitly register a previously captured draft as a runnable read-only workflow."""
+    payload = request.get_json(force=True) or {}
+    site_id = payload.get("site_id", "")
+    workflow_id = payload.get("workflow_id", "")
+    workflow_path = WORKFLOWS_DIR / site_id / f"{workflow_id}.json"
+    if not workflow_path.exists():
+        return jsonify({"error": "draft_workflow_not_found"}), 404
+    workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+    policy = _load_site_policy(site_id)
+    if workflow.get("status") != "draft" or workflow.get("action_mode") != "read_only":
+        return jsonify({"error": "only_readonly_drafts_can_be_saved"}), 400
+    for step in workflow.get("steps", []):
+        if step.get("action_safety_level") != "read_only" or step.get("action", {}).get("type") != "navigate":
+            return jsonify({"error": "workflow_contains_unsafe_step"}), 400
+        assert_same_origin_https(step["action"]["to_url"], policy)
+    workflow["status"] = "active"
+    workflow["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    workflow_path.write_text(json.dumps(workflow, indent=2), encoding="utf-8")
+    index = json.loads(WORKFLOWS_INDEX_PATH.read_text(encoding="utf-8"))
+    index["workflows"] = [w for w in index.get("workflows", []) if not (w.get("site_id") == site_id and w.get("workflow_id") == workflow_id)]
+    index["workflows"].append({
+        "site_id": site_id, "workflow_id": workflow_id, "workflow_title": workflow["workflow_title"],
+        "path": str(workflow_path), "site_policy_path": str(SITE_POLICIES_DIR / f"{site_id}.json"),
+        "step_count": len(workflow["steps"]), "captured_at": workflow.get("captured_at"), "status": "active",
+    })
+    WORKFLOWS_INDEX_PATH.write_text(json.dumps(index, indent=2), encoding="utf-8")
+    return jsonify({"status": "saved", "workflow": workflow})
+
+
+@app.route("/api/workflow/replay", methods=["POST"])
+def api_workflow_replay():
+    """Replay an explicitly saved read-only workflow in a dedicated Playwright profile."""
+    payload = request.get_json(force=True) or {}
+    site_id, workflow_id = payload.get("site_id", ""), payload.get("workflow_id", "")
+    match = next((w for w in _list_workflows(site_id) if w.get("workflow_id") == workflow_id and w.get("status") == "active"), None)
+    if not match:
+        return jsonify({"error": "active_workflow_not_found"}), 404
+    workflow, policy = _load_workflow_file(match["path"]), _load_site_policy(site_id)
+    try:
+        results = replay_readonly_workflow(policy=policy, workflow=workflow, headless=bool(payload.get("headless", False)))
+    except PlaywrightSafetyError as exc:
+        return jsonify({"error": "replay_refused", "reason": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": "replay_failed", "reason": str(exc)}), 502
+    return jsonify({"status": "replayed", "results": results})
 
 
 @app.route("/api/validate-domain", methods=["POST"])
@@ -744,10 +856,18 @@ def api_session_start():
     _save_session(session)
     _bootstrap_event_counter(session_id)
     push_event(session_id, "safety", f"Domain validated: {domain_check['domain']} is allowed for {site_id}.", meta=domain_check)
-    push_event(session_id, "narration", "Welcome. I’ll show you how to review a new inbound lead. Ask a question at any time.", step_id=workflow["steps"][0]["step_id"], meta={"opening": True})
+    push_event(
+        session_id, "narration",
+        f"Welcome. I’ll guide you through {workflow.get('workflow_title', 'this read-only walkthrough')}. Ask a question at any time.",
+        step_id=workflow["steps"][0]["step_id"], meta={"opening": True},
+    )
     push_event(session_id, "state", f"Workflow started: {workflow.get('workflow_title')}", meta={"status": "in_progress"})
 
-    spawn_hermes_run(session_id, site_id, workflow_id)
+    policy = _load_site_policy(site_id)
+    if workflow.get("execution_engine") == "playwright_readonly":
+        spawn_playwright_run(session_id, policy, workflow)
+    else:
+        spawn_hermes_run(session_id, site_id, workflow_id)
 
     return jsonify({"session_id": session_id, "session": session, "domain_check": domain_check})
 
@@ -771,7 +891,13 @@ def api_session_resume():
     session["status"] = "in_progress"
     _save_session(session)
     push_event(session_id, "state", f"Resuming from {session.get('next_step')}.", meta={"status": "in_progress"})
-    spawn_hermes_run(session_id, session["site_id"], session["workflow_id"])
+    wfs = _list_workflows(session["site_id"])
+    match = next((w for w in wfs if w.get("workflow_id") == session["workflow_id"]), None)
+    workflow = _load_workflow_file(match["path"]) if match else None
+    if workflow and workflow.get("execution_engine") == "playwright_readonly":
+        spawn_playwright_run(session_id, _load_site_policy(session["site_id"]), workflow)
+    else:
+        spawn_hermes_run(session_id, session["site_id"], session["workflow_id"])
     return jsonify({"session": session})
 
 

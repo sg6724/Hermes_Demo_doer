@@ -79,6 +79,20 @@ export const PathPilotAPI = {
     return apiFetch("/api/teach/start", { method: "POST", json: { active_tab_url: activeTabUrl, display_name: displayName } });
   },
 
+  captureTeachStep(activeTabUrl, workflowTitle, visibleLinkText) {
+    return apiFetch("/api/teach/capture", { method: "POST", json: {
+      active_tab_url: activeTabUrl, workflow_title: workflowTitle, visible_link_text: visibleLinkText,
+    } });
+  },
+
+  saveTeachWorkflow(siteId, workflowId) {
+    return apiFetch("/api/teach/save", { method: "POST", json: { site_id: siteId, workflow_id: workflowId } });
+  },
+
+  replayWorkflow(siteId, workflowId) {
+    return apiFetch("/api/workflow/replay", { method: "POST", json: { site_id: siteId, workflow_id: workflowId } });
+  },
+
   conversationalSignedUrl() {
     return apiFetch("/api/convai/signed-url", { method: "POST", json: {} });
   },

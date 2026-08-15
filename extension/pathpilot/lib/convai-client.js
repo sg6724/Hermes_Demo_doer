@@ -10,6 +10,9 @@ export class ConvAIClient {
   async connect() {
     if (this.ws?.readyState === WebSocket.OPEN) return;
     this.onStatus?.("Connecting voice…");
+    // ElevenLabs sends raw PCM. Create/resume the output context while this
+    // is still running inside the user-initiated Start/Teach click gesture.
+    this._audioContext();
     const { signed_url } = await this.getSignedUrl();
     await new Promise((resolve, reject) => {
       const ws = this.ws = new WebSocket(signed_url);
@@ -57,8 +60,24 @@ export class ConvAIClient {
     const bytes = new Uint8Array(pcm.buffer); let binary=""; for (const b of bytes) binary += String.fromCharCode(b);
     if (this.ws?.readyState===WebSocket.OPEN) this.ws.send(JSON.stringify({ type:"user_audio_chunk", user_audio_chunk:btoa(binary) }));
   }
-  async _play(b64) {
-    try { const bytes=Uint8Array.from(atob(b64), c=>c.charCodeAt(0)); const ctx=this.ctx || new AudioContext(); const buffer=await ctx.decodeAudioData(bytes.buffer); const src=ctx.createBufferSource(); src.buffer=buffer; src.connect(ctx.destination); this.playing.add(src); src.onended=()=>this.playing.delete(src); src.start(); this.onAudio?.(); } catch (_) { /* malformed/partial chunks are ignored; text remains visible */ }
+  _audioContext() {
+    if (!this.ctx || this.ctx.state === "closed") this.ctx = new AudioContext();
+    if (this.ctx.state === "suspended") this.ctx.resume().catch(() => {});
+    return this.ctx;
+  }
+  _play(b64) {
+    try {
+      // agent_output_audio_format is pcm_16000: signed 16-bit little-endian
+      // samples, not an encoded WAV or MP3 file.
+      const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      const pcm = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      const ctx = this._audioContext();
+      const buffer = ctx.createBuffer(1, pcm.length, 16000);
+      const channel = buffer.getChannelData(0);
+      for (let i = 0; i < pcm.length; i++) channel[i] = pcm[i] / 32768;
+      const src = ctx.createBufferSource(); src.buffer = buffer; src.connect(ctx.destination);
+      this.playing.add(src); src.onended = () => this.playing.delete(src); src.start(); this.onAudio?.();
+    } catch (error) { this.onError?.(new Error(`Voice playback failed: ${error.message}`)); }
   }
   stopAudio() { for (const src of this.playing) try { src.stop(); } catch {} this.playing.clear(); }
   close() { this.stopAudio(); try { this.ws?.close(); } catch {} this.stream?.getTracks().forEach(t=>t.stop()); this.ctx?.close(); this.ws=null; this.stream=null; this.ctx=null; }

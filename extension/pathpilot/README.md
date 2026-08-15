@@ -46,6 +46,18 @@ The controller prints its local pairing-token file location on startup. It gener
 9. Open a permitted HubSpot test-portal tab in the same dedicated profile. The side panel should show **Connected**.
 10. Choose **HubSpot (test portal)** → **Review an inbound lead and prepare a follow-up** → your conversation mode. Start is disabled until the active tab’s domain passes the selected site policy.
 
+## Reloading after local source changes
+
+Chrome does not hot-reload unpacked extensions. After editing any file under `D:\hermes\extension\pathpilot` (including the side panel HTML/JS/CSS), you must:
+
+1. Open `chrome://extensions` in the dedicated test-profile Chromium window.
+2. Click **Reload** on the PathPilot card (or toggle it off/on).
+3. Close and reopen the Side Panel (click the toolbar icon again) so it picks up the reloaded scripts.
+
+Editing files alone does nothing until you reload — a stale side panel will keep running the old JS even if the HTML on disk has changed. Bump `version` in `manifest.json` on any user-visible fix so `chrome://extensions` clearly shows a new build is loaded.
+
+If Teach Mode ever shows a UI error like "missing element(s) ...", it means the side panel HTML and JS have drifted out of sync (usually because Reload wasn't clicked after an edit) — reload the extension and reopen the panel before reporting a bug.
+
 ## Permissions
 
 The manifest requests only:

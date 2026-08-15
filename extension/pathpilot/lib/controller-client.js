@@ -89,6 +89,10 @@ export const PathPilotAPI = {
     return apiFetch("/api/teach/save", { method: "POST", json: { site_id: siteId, workflow_id: workflowId } });
   },
 
+  logEvent(sessionId, eventType, text, meta) {
+    return apiFetch("/api/events", { method: "POST", json: { session_id: sessionId, event_type: eventType, text, meta } });
+  },
+
   replayWorkflow(siteId, workflowId) {
     return apiFetch("/api/workflow/replay", { method: "POST", json: { site_id: siteId, workflow_id: workflowId } });
   },
@@ -97,10 +101,10 @@ export const PathPilotAPI = {
     return apiFetch("/api/convai/signed-url", { method: "POST", json: {} });
   },
 
-  startSession(siteId, workflowId, activeTabUrl, sessionId) {
+  startSession(siteId, workflowId, activeTabUrl, mode, sessionId) {
     return apiFetch("/api/session/start", {
       method: "POST",
-      json: { site_id: siteId, workflow_id: workflowId, active_tab_url: activeTabUrl, session_id: sessionId },
+      json: { site_id: siteId, workflow_id: workflowId, active_tab_url: activeTabUrl, mode, session_id: sessionId },
     });
   },
 
@@ -108,8 +112,8 @@ export const PathPilotAPI = {
     return apiFetch("/api/session/pause", { method: "POST", json: { session_id: sessionId } });
   },
 
-  resumeSession(sessionId) {
-    return apiFetch("/api/session/resume", { method: "POST", json: { session_id: sessionId } });
+  resumeSession(sessionId, mode) {
+    return apiFetch("/api/session/resume", { method: "POST", json: { session_id: sessionId, mode } });
   },
 
   stopSession(sessionId) {

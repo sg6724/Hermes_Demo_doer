@@ -1,0 +1,11 @@
+{
+  "provider": "elevenlabs",
+  "enabled": true,
+  "voice_id": "EXAVITQu4vr4xnSDxMaL",
+  "voice_name": "Sarah",
+  "voice_description": "Mature, Reassuring, Confident (ElevenLabs premade/stock voice)",
+  "model_id": "eleven_flash_v2_5",
+  "output_format": "mp3_44100_128",
+  "max_words_per_utterance": 35,
+  "notes": "Non-secret configuration only. The ElevenLabs API key is never stored here; it is read at runtime from D:\\hermes\\.env or the ELEVENLABS_API_KEY environment variable."
+}

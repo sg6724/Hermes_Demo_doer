@@ -1,0 +1,65 @@
+// Persistent ElevenLabs Conversational AI client for PathPilot.
+// Uses only a short-lived signed URL supplied by the paired localhost controller.
+// No ElevenLabs API key is ever present in extension code or storage.
+export class ConvAIClient {
+  constructor({ getSignedUrl, onStatus, onTranscript, onResponse, onAudio, onError, playAudio = true }) {
+    Object.assign(this, { getSignedUrl, onStatus, onTranscript, onResponse, onAudio, onError, playAudio });
+    this.ws = null; this.ctx = null; this.stream = null; this.source = null;
+    this.processor = null; this.capturing = false; this.playing = new Set();
+  }
+  async connect() {
+    if (this.ws?.readyState === WebSocket.OPEN) return;
+    this.onStatus?.("Connecting voice…");
+    const { signed_url } = await this.getSignedUrl();
+    await new Promise((resolve, reject) => {
+      const ws = this.ws = new WebSocket(signed_url);
+      ws.onopen = () => { this.onStatus?.("Voice ready"); resolve(); };
+      ws.onerror = () => reject(new Error("Voice connection failed"));
+      ws.onclose = () => { if (this.capturing) this.onStatus?.("Voice disconnected"); };
+      ws.onmessage = (e) => this._message(e.data);
+    });
+  }
+  async _message(raw) {
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    if (m.type === "agent_response") {
+      const text = m.agent_response_event?.agent_response || "";
+      if (text) { this.onResponse?.(text); this.onStatus?.("PathPilot is speaking"); }
+    } else if (m.type === "user_transcript") {
+      const text = m.user_transcription_event?.user_transcript || "";
+      if (text) { this.onTranscript?.(text); this.onStatus?.("Checking the current screen"); }
+    } else if (m.type === "audio") {
+      const b64 = m.audio_event?.audio_base_64;
+      if (b64 && this.playAudio) this._play(b64);
+    } else if (m.type === "interruption") {
+      this.stopAudio(); this.onStatus?.("Listening");
+    }
+  }
+  async prepareMic() {
+    if (this.stream) return;
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:true, noiseSuppression:true, autoGainControl:true } });
+    this.ctx = new AudioContext();
+    this.source = this.ctx.createMediaStreamSource(this.stream);
+    this.processor = this.ctx.createScriptProcessor(4096, 1, 1);
+    this.processor.onaudioprocess = (e) => { if (this.capturing) this._sendPcm(e.inputBuffer.getChannelData(0)); };
+    this.source.connect(this.processor); this.processor.connect(this.ctx.destination);
+  }
+  sendText(text) {
+    if (!text?.trim() || this.ws?.readyState !== WebSocket.OPEN) throw new Error("Voice conversation is not connected");
+    this.ws.send(JSON.stringify({ type: "user_message", text: text.trim() }));
+    this.onTranscript?.(text.trim()); this.onStatus?.("Checking the current screen");
+  }
+  startCapture() { if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error("Voice is not connected"); this.stopAudio(); this.capturing=true; this.onStatus?.("Listening"); }
+  stopCapture() { if (!this.capturing) return; this.capturing=false; if (this.ws?.readyState===WebSocket.OPEN) this.ws.send(JSON.stringify({ type:"user_audio_chunk", user_audio_chunk: "" })); this.onStatus?.("Transcribing"); }
+  _sendPcm(float32) {
+    const rate = this.ctx.sampleRate, target = 16000, ratio = rate / target, n = Math.floor(float32.length / ratio);
+    const pcm = new Int16Array(n);
+    for (let i=0;i<n;i++) { const x=float32[Math.min(float32.length-1, Math.floor(i*ratio))]; pcm[i]=Math.max(-1,Math.min(1,x))*0x7fff; }
+    const bytes = new Uint8Array(pcm.buffer); let binary=""; for (const b of bytes) binary += String.fromCharCode(b);
+    if (this.ws?.readyState===WebSocket.OPEN) this.ws.send(JSON.stringify({ type:"user_audio_chunk", user_audio_chunk:btoa(binary) }));
+  }
+  async _play(b64) {
+    try { const bytes=Uint8Array.from(atob(b64), c=>c.charCodeAt(0)); const ctx=this.ctx || new AudioContext(); const buffer=await ctx.decodeAudioData(bytes.buffer); const src=ctx.createBufferSource(); src.buffer=buffer; src.connect(ctx.destination); this.playing.add(src); src.onended=()=>this.playing.delete(src); src.start(); this.onAudio?.(); } catch (_) { /* malformed/partial chunks are ignored; text remains visible */ }
+  }
+  stopAudio() { for (const src of this.playing) try { src.stop(); } catch {} this.playing.clear(); }
+  close() { this.stopAudio(); try { this.ws?.close(); } catch {} this.stream?.getTracks().forEach(t=>t.stop()); this.ctx?.close(); this.ws=null; this.stream=null; this.ctx=null; }
+}

@@ -143,18 +143,48 @@ def capture_readonly_navigation(
         playwright.stop()
 
 
-def replay_readonly_workflow(*, policy: dict[str, Any], workflow: dict[str, Any], headless: bool = False) -> list[dict[str, str]]:
-    """Replay persisted read-only URL steps, validating policy before every action."""
+def replay_readonly_workflow(
+    *, policy: dict[str, Any], workflow: dict[str, Any], headless: bool = False,
+    on_step_narrate=None, control=None,
+) -> list[dict[str, str]]:
+    """Replay persisted read-only URL steps, validating policy before every action.
+
+    on_step_narrate(step, page_excerpt) is called right after each successful
+    navigation so the caller can speak an explanation grounded in the real
+    visible page text -- the walkthrough should explain what it is looking
+    at, not just announce that it navigated.
+
+    control() is polled before every step and must return "continue",
+    "pause", or "stop". "pause" blocks (re-polling every second) until the
+    caller flips it back to "continue" or "stop" -- this is what lets a user
+    interrupt an autonomous walkthrough that is already in progress instead
+    of only being able to interrupt between separate button clicks.
+    """
     playwright, context = _open_context(policy, headless=headless)
     results: list[dict[str, str]] = []
     try:
         page = context.pages[0] if context.pages else context.new_page()
         for step in workflow.get("steps", []):
+            if control:
+                waited = 0
+                while True:
+                    state = control()
+                    if state == "stop":
+                        raise PlaywrightSafetyError("Walkthrough stopped by user")
+                    if state == "continue":
+                        break
+                    time.sleep(1)
+                    waited += 1
+                    if waited > 900:  # 15 minutes paused with no resume -- give up quietly
+                        raise PlaywrightSafetyError("Walkthrough paused too long and was stopped")
             if step.get("action_safety_level") != "read_only" or step.get("action", {}).get("type") != "navigate":
                 raise PlaywrightSafetyError("Replay refused: workflow contains a non-read-only navigation step")
             target = assert_same_origin_https(step["action"]["to_url"], policy)
             page.goto(target, wait_until="domcontentloaded", timeout=30_000)
             actual = assert_same_origin_https(page.url, policy)
+            excerpt = page.locator("body").inner_text(timeout=10_000).strip()[:800]
+            if on_step_narrate:
+                on_step_narrate(step, excerpt)
             results.append({"step_id": step["step_id"], "url": actual, "verification": step["verification"]})
         return results
     finally:

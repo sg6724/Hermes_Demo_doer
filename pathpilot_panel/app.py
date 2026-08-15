@@ -52,6 +52,7 @@ from playwright_executor import (
     capture_readonly_navigation,
     replay_readonly_workflow,
 )
+import transcript_store
 
 REPO_ROOT = Path(r"D:\hermes")
 ENV_PATH = REPO_ROOT / ".env"
@@ -246,6 +247,13 @@ def push_event(session_id: str, event_type: str, text: str, step_id: str | None 
         "meta": meta or {},
     }
     _append_jsonl(_events_path(session_id), event)
+    try:
+        transcript_store.record_event(
+            session_id, event_id, event_type, text,
+            step_id=step_id, meta_json=json.dumps(meta or {}),
+        )
+    except Exception:
+        pass
     return event
 
 
@@ -427,6 +435,32 @@ def _fuzzy_match_step(workflow: dict, hint: str | None) -> dict | None:
 
 # ---- Hermes as the decision-making brain -----------------------------------------
 
+def explain_visible_page(step: dict, page_excerpt: str) -> str:
+    """Generate a short spoken explanation of what is actually visible on the
+    page just navigated to, grounded in the real captured page text -- never
+    a hard-coded, site-specific placeholder sentence."""
+    step_name = step.get("name", "this page")
+    prompt = (
+        "You are PathPilot, a voice walkthrough assistant. You just navigated a "
+        f"read-only browser to \"{step_name}\". Explain in ONE short spoken sentence "
+        "(under 30 words, plain English, no markdown, no lists) what this page shows, "
+        "using ONLY the visible text captured below as ground truth. Do not invent "
+        "anything not present in the text.\n\n"
+        f"Visible page text: {page_excerpt[:600]}"
+    )
+    try:
+        result = subprocess.run(
+            [HERMES_EXE, "chat", "-Q", "-q", prompt, "--max-turns", "1", "--ignore-rules"],
+            capture_output=True, text=True, timeout=30,
+        )
+        answer = (result.stdout or "").strip()
+        if answer:
+            return answer
+    except Exception:
+        pass
+    return f"Here is {step_name}."
+
+
 def ask_hermes(question: str, session: dict, workflow: dict) -> tuple[str, float]:
     current_step_id = session.get("current_step") or "step-1"
     step = _step_by_id(workflow, current_step_id) or {}
@@ -440,7 +474,8 @@ def ask_hermes(question: str, session: dict, workflow: dict) -> tuple[str, float
     )
     prompt = (
         "You are PathPilot, a voice walkthrough assistant answering a customer's spoken question "
-        "in the middle of a live HubSpot CRM demo. Answer ONLY using the verified visible page facts "
+        f"during a live read-only walkthrough of {workflow.get('workflow_title', 'this website')}. "
+        "Answer ONLY using the verified visible page facts "
         "given below as ground truth. If the facts don't cover it, you may add general knowledge but "
         "you MUST prefix that part with 'General guidance:'. Never guess. Keep the answer under 60 words, "
         "plain spoken English, no markdown, no lists, no selectors, no JSON, no internal reasoning.\n\n"
@@ -491,25 +526,74 @@ def spawn_hermes_run(session_id: str, site_id: str, workflow_id: str) -> None:
     t.start()
 
 
-def spawn_playwright_run(session_id: str, policy: dict, workflow: dict) -> None:
-    """Replay a controller-validated read-only workflow in a dedicated visible browser."""
-    def _run():
+def spawn_playwright_run(session_id: str, policy: dict, workflow: dict, mode: str = "voice_voice") -> None:
+    """Autonomously replay a controller-validated read-only workflow in a
+    dedicated visible browser, narrating and explaining each page as it
+    goes, and pausing (rather than stopping) whenever the user interrupts.
+
+    Narration and step-completion are spoken through speak_text() (the same
+    ElevenLabs/ffplay TTS pipeline used elsewhere), not just logged silently
+    -- the live walkthrough must actually be heard, not only shown as text.
+
+    control() re-checks the session's durable status before every step so a
+    barge-in (POST /api/interrupt) or explicit Pause can halt navigation
+    mid-walkthrough; Resume (or answering a question) flips status back to
+    in_progress and this same thread continues from the next unvisited step
+    -- it never needs to be respawned.
+    """
+    def _control() -> str:
         try:
-            push_event(session_id, "state", "Opening the dedicated read-only browser.")
-            results = replay_readonly_workflow(policy=policy, workflow=workflow, headless=False)
+            status = _load_session(session_id).get("status")
+        except Exception:
+            return "stop"
+        if status == "stopped":
+            return "stop"
+        if status == "paused":
+            return "pause"
+        return "continue"
+
+    def _narrate_step(step: dict, page_excerpt: str) -> None:
+        explanation = explain_visible_page(step, page_excerpt)
+        speak_text(session_id, explanation, step["step_id"], "narration", mode=mode)
+
+    def _run():
+        with _active_playwright_lock:
+            _active_playwright_sessions.add(session_id)
+        try:
+            speak_text(session_id, "Opening the dedicated read-only browser now.", None, "narration", mode=mode)
+            results = replay_readonly_workflow(
+                policy=policy, workflow=workflow, headless=False,
+                on_step_narrate=_narrate_step, control=_control,
+            )
             session = _load_session(session_id)
             for result in results:
-                push_event(session_id, "narration", f"Opened the verified page for {result['step_id']}.", step_id=result["step_id"])
                 push_event(session_id, "verification", result["verification"], step_id=result["step_id"], meta={"url": result["url"]})
                 session["last_completed_step"] = result["step_id"]
                 session["current_step"] = result["step_id"]
             session["next_step"] = "complete"
             session["status"] = "completed"
             _save_session(session)
+            speak_text(session_id, "This read-only walkthrough is complete. I'm still here for questions.", None, "narration", mode=mode)
             push_event(session_id, "state", "Read-only walkthrough completed.", meta={"status": "completed"})
+        except PlaywrightSafetyError as exc:
+            session = _load_session(session_id)
+            if session.get("status") != "stopped":
+                session["status"] = "stopped"
+                _save_session(session)
+            push_event(session_id, "safety", f"Read-only browser walkthrough stopped: {exc}", meta={"error": True})
         except Exception as exc:  # noqa: BLE001
             push_event(session_id, "safety", f"Read-only browser walkthrough stopped: {exc}", meta={"error": True})
+        finally:
+            with _active_playwright_lock:
+                _active_playwright_sessions.discard(session_id)
 
+    with _active_playwright_lock:
+        if session_id in _active_playwright_sessions:
+            # A pause loop for this session is already alive inside an
+            # existing thread -- do not start a second one racing the same
+            # workflow. The existing thread's control() will pick up the
+            # status flip (paused -> in_progress) on its own next poll.
+            return
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -518,6 +602,8 @@ def spawn_playwright_run(session_id: str, policy: dict, workflow: dict) -> None:
 _playback_lock = threading.Lock()
 _current_ffplay_proc: subprocess.Popen | None = None
 _speaking_sessions: dict[str, bool] = {}
+_active_playwright_sessions: set[str] = set()
+_active_playwright_lock = threading.Lock()
 
 
 def _find_ffplay() -> str | None:
@@ -817,6 +903,7 @@ def api_session_start():
     site_id = payload.get("site_id")
     workflow_id = payload.get("workflow_id")
     active_tab_url = payload.get("active_tab_url", "")
+    mode = payload.get("mode", "voice_voice")
     session_id = payload.get("session_id") or f"{site_id}-{workflow_id}-{uuid.uuid4().hex[:8]}"
 
     domain_check = _validate_domain(site_id, active_tab_url)
@@ -856,16 +943,16 @@ def api_session_start():
     _save_session(session)
     _bootstrap_event_counter(session_id)
     push_event(session_id, "safety", f"Domain validated: {domain_check['domain']} is allowed for {site_id}.", meta=domain_check)
-    push_event(
-        session_id, "narration",
+    speak_text(
+        session_id,
         f"Welcome. I’ll guide you through {workflow.get('workflow_title', 'this read-only walkthrough')}. Ask a question at any time.",
-        step_id=workflow["steps"][0]["step_id"], meta={"opening": True},
+        workflow["steps"][0]["step_id"], "narration", mode=mode,
     )
     push_event(session_id, "state", f"Workflow started: {workflow.get('workflow_title')}", meta={"status": "in_progress"})
 
     policy = _load_site_policy(site_id)
     if workflow.get("execution_engine") == "playwright_readonly":
-        spawn_playwright_run(session_id, policy, workflow)
+        spawn_playwright_run(session_id, policy, workflow, mode=mode)
     else:
         spawn_hermes_run(session_id, site_id, workflow_id)
 
@@ -887,6 +974,7 @@ def api_session_pause():
 def api_session_resume():
     payload = request.get_json(force=True) or {}
     session_id = payload.get("session_id")
+    mode = payload.get("mode", "voice_voice")
     session = _load_session(session_id)
     session["status"] = "in_progress"
     _save_session(session)
@@ -894,9 +982,16 @@ def api_session_resume():
     wfs = _list_workflows(session["site_id"])
     match = next((w for w in wfs if w.get("workflow_id") == session["workflow_id"]), None)
     workflow = _load_workflow_file(match["path"]) if match else None
+    with _active_playwright_lock:
+        already_running = session_id in _active_playwright_sessions
     if workflow and workflow.get("execution_engine") == "playwright_readonly":
-        spawn_playwright_run(session_id, _load_site_policy(session["site_id"]), workflow)
-    else:
+        if not already_running:
+            # The original walkthrough thread already exited (e.g. after a
+            # controller restart) -- safe to start a fresh one. If it is
+            # still alive in its pause loop, spawn_playwright_run() is a
+            # no-op and that thread's own control() picks up the resume.
+            spawn_playwright_run(session_id, _load_site_policy(session["site_id"]), workflow, mode=mode)
+    elif not already_running:
         spawn_hermes_run(session_id, session["site_id"], session["workflow_id"])
     return jsonify({"session": session})
 
@@ -987,6 +1082,17 @@ def api_events_get():
     return jsonify({"events": _load_events(session_id, since)})
 
 
+@app.route("/api/transcript")
+def api_transcript_get():
+    """Durable SQLite transcript for one session -- survives extension
+    reloads, panel crashes, and controller restarts, unlike the in-memory
+    chat DOM."""
+    session_id = request.args.get("session_id")
+    if not session_id:
+        return jsonify({"error": "session_id_required"}), 400
+    return jsonify({"session_id": session_id, "events": transcript_store.load_transcript(session_id)})
+
+
 @app.route("/api/speak", methods=["POST"])
 def api_speak():
     payload = request.get_json(force=True) or {}
@@ -1006,7 +1112,21 @@ def api_interrupt():
     was_speaking = stop_speaking(session_id)
     if was_speaking:
         push_event(session_id, "safety", "Barge-in: customer started speaking, PathPilot's audio was stopped immediately.")
-    return jsonify({"barge_in": was_speaking})
+    # Also pause the autonomous walkthrough itself (if one is running) so it
+    # stops navigating/narrating further steps while the user is talking --
+    # this is what makes the walkthrough genuinely interruptible instead of
+    # continuing to advance underneath a live conversation.
+    paused_walkthrough = False
+    try:
+        session = _load_session(session_id)
+        if session.get("status") == "in_progress":
+            session["status"] = "paused"
+            _save_session(session)
+            push_event(session_id, "state", "Walkthrough paused for your question.", meta={"status": "paused"})
+            paused_walkthrough = True
+    except Exception:
+        pass
+    return jsonify({"barge_in": was_speaking, "walkthrough_paused": paused_walkthrough})
 
 
 # ---- Routes: question handling (voice + text fallback) ---------------------------
